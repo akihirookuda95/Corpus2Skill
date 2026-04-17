@@ -9,17 +9,11 @@ Corpus2Skill converts a collection of documents into a structured tree of [Anthr
 ## How It Works
 
 ```
-┌─────────────┐      ┌─────────────┐      ┌─────────────┐      ┌──────────────┐
-│  Documents   │ ──── │  Embed +    │ ──── │  Summarize  │ ──── │  Skill Tree  │
-│  (any text)  │      │  Cluster    │      │  & Label    │      │  (.claude/)  │
-└─────────────┘      └─────────────┘      └─────────────┘      └──────────────┘
-                                                                       │
-                                                                       ▼
-                                                              ┌──────────────┐
-                                                              │  LLM Agent   │
-                                                              │  navigates   │
-                                                              │  hierarchy   │
-                                                              └──────────────┘
+Documents ──> Embed + Cluster ──> Summarize & Label ──> Skill Tree (.claude/)
+(any text)                                                      |
+                                                                v
+                                                         LLM Agent navigates
+                                                         hierarchy at query time
 ```
 
 **Compile time** — documents are embedded, clustered hierarchically, and summarized by an LLM into a skill tree with navigable index files.
