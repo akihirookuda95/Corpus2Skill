@@ -12,7 +12,7 @@ class CompileConfig:
     output_dir: Path = Path("c2s_output")
 
     p: int = 10
-    max_top_clusters: int = 10
+    max_top_clusters: int = 8
     min_cluster_size: int = 3
 
     embed_model: str = "Qwen/Qwen3-Embedding-0.6B"

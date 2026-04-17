@@ -86,7 +86,7 @@ def build_hierarchy(
     doc_texts: list[str],
     embeddings: np.ndarray,
     p: int = 10,
-    max_top: int = 10,
+    max_top: int = 8,
     min_cluster_size: int = 3,
     summarize_fn=None,
     summarize_batch_fn=None,

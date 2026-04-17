@@ -2,6 +2,8 @@
 
 **Distill any document corpus into a navigable skill hierarchy for LLM agents — no retrieval system needed at serve time.**
 
+This is the official implementation of the paper [**"Don't Retrieve, Navigate: Distilling Enterprise Knowledge into Navigable Agent Skills for QA and RAG"**](https://arxiv.org/abs/2604.14572) (Sun, Wei, and Hsieh, 2026).
+
 Corpus2Skill converts a collection of documents into a structured tree of [Anthropic Skills](https://docs.anthropic.com/en/docs/build-with-claude/skills). At query time, the LLM agent navigates this hierarchy (reading SKILL.md / INDEX.md files, drilling into sub-topics) and fetches full documents on demand — without embeddings, vector stores, or BM25 at serve time.
 
 > **🚧 Work in Progress** — This is an early release. The core pipeline works end-to-end, but rough edges remain. We're actively improving it and would love your feedback! Please [open an issue](../../issues) if you run into problems or have suggestions.
@@ -56,7 +58,7 @@ python -m corpus2skill \
 
 **Key flags:**
 - `--p` — branching ratio (how many children per cluster node; default 10)
-- `--max-top` — maximum top-level skills (default 10)
+- `--max-top` — maximum top-level skills (default 8)
 - `--model` — LLM for summarization (default `claude-sonnet-4-6`)
 - `--embed-model` — embedding model (default `Qwen/Qwen3-Embedding-0.6B`)
 - `--compact` — merge leaf INDEX.md into parent to reduce file count
@@ -136,6 +138,20 @@ This project is in active development. Contributions, bug reports, and feature r
 - **Have an idea?** [Start a discussion](../../issues)
 - **Want to contribute?** PRs are welcome — please open an issue first to discuss larger changes
 
-## License
+## Citation
 
-Apache 2.0 — see [LICENSE](LICENSE).
+If you use Corpus2Skill in your research, please cite:
+
+```bibtex
+@misc{sun2026dontretrievenavigatedistilling,
+      title={Don't Retrieve, Navigate: Distilling Enterprise Knowledge into Navigable Agent Skills for QA and RAG},
+      author={Yiqun Sun and Pengfei Wei and Lawrence B. Hsieh},
+      year={2026},
+      eprint={2604.14572},
+      archivePrefix={arXiv},
+      primaryClass={cs.IR},
+      url={https://arxiv.org/abs/2604.14572},
+}
+```
+
+Paper: [arXiv:2604.14572](https://arxiv.org/abs/2604.14572)

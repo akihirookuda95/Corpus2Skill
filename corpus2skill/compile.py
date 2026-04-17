@@ -217,7 +217,7 @@ def main():
     parser.add_argument("--input", type=Path, required=True, help="Input document directory")
     parser.add_argument("--output", type=Path, default=Path("c2s_output"), help="Output directory")
     parser.add_argument("--p", type=int, default=10, help="Branching ratio (default: 10)")
-    parser.add_argument("--max-top", type=int, default=10, help="Max top-level clusters")
+    parser.add_argument("--max-top", type=int, default=8, help="Max top-level clusters")
     parser.add_argument("--model", type=str, default="claude-sonnet-4-6", help="LLM model")
     parser.add_argument("--embed-model", type=str, default="Qwen/Qwen3-Embedding-0.6B")
     parser.add_argument("--compact", action="store_true",
