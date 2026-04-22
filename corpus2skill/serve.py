@@ -277,7 +277,17 @@ def answer_query(
     messages: list[dict[str, Any]] = [
         {"role": "user", "content": query}
     ]
-    system_prompt = [{"type": "text", "text": SYSTEM_PROMPT}]
+    # Attach a cache breakpoint so the stable prefix (tools + system) is
+    # served from Anthropic's prompt cache on turns 2+. Savings show up as
+    # cache_read_input_tokens in response.usage at 10x cheaper than base
+    # input ($0.30 vs $3.00 / MTok for Sonnet).
+    system_prompt = [
+        {
+            "type": "text",
+            "text": SYSTEM_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
 
     skills_referenced: set[str] = set()
     docs_retrieved: list[str] = []
@@ -285,6 +295,9 @@ def answer_query(
     tool_trace: list[dict] = []
     total_input = 0
     total_output = 0
+    total_cache_read = 0
+    total_cache_write = 0
+    per_turn_usage: list[dict] = []
     start = time.time()
 
     for turn in range(cfg.max_turns):
@@ -307,8 +320,36 @@ def answer_query(
                 continue
             raise
 
-        total_input += getattr(response.usage, "input_tokens", 0)
-        total_output += getattr(response.usage, "output_tokens", 0)
+        u = response.usage
+        t_in = getattr(u, "input_tokens", 0) or 0
+        t_out = getattr(u, "output_tokens", 0) or 0
+        t_cr = getattr(u, "cache_read_input_tokens", 0) or 0
+        t_cw = getattr(u, "cache_creation_input_tokens", 0) or 0
+        # cache_creation may break out 5m / 1h; keep both for future-proofing
+        cc = getattr(u, "cache_creation", None)
+        cc_5m = getattr(cc, "ephemeral_5m_input_tokens", 0) if cc else 0
+        cc_1h = getattr(cc, "ephemeral_1h_input_tokens", 0) if cc else 0
+        stu = getattr(u, "server_tool_use", None)
+        web_fetch = getattr(stu, "web_fetch_requests", 0) if stu else 0
+        web_search = getattr(stu, "web_search_requests", 0) if stu else 0
+
+        total_input += t_in
+        total_output += t_out
+        total_cache_read += t_cr
+        total_cache_write += t_cw
+        per_turn_usage.append({
+            "turn": turn,
+            "input_tokens": t_in,
+            "output_tokens": t_out,
+            "cache_read_input_tokens": t_cr,
+            "cache_creation_input_tokens": t_cw,
+            "cache_write_5m": cc_5m,
+            "cache_write_1h": cc_1h,
+            "server_tool_use": {
+                "web_fetch_requests": web_fetch,
+                "web_search_requests": web_search,
+            },
+        })
 
         messages.append({"role": "assistant", "content": response.content})
 
@@ -368,8 +409,13 @@ def answer_query(
                 "tool_trace": tool_trace,
                 "input_tokens": total_input,
                 "output_tokens": total_output,
+                "cache_read_input_tokens": total_cache_read,
+                "cache_creation_input_tokens": total_cache_write,
+                "per_turn_usage": per_turn_usage,
                 "latency": time.time() - start,
-                "cost_usd": _estimate_cost(total_input, total_output, cfg.llm_model),
+                "cost_usd": _compute_cost(
+                    total_input, total_output, total_cache_read, total_cache_write, cfg.llm_model
+                ),
             }
 
     last5 = docs_texts[-5:]
@@ -382,8 +428,13 @@ def answer_query(
         "tool_trace": tool_trace,
         "input_tokens": total_input,
         "output_tokens": total_output,
+        "cache_read_input_tokens": total_cache_read,
+        "cache_creation_input_tokens": total_cache_write,
+        "per_turn_usage": per_turn_usage,
         "latency": time.time() - start,
-        "cost_usd": _estimate_cost(total_input, total_output, cfg.llm_model),
+        "cost_usd": _compute_cost(
+            total_input, total_output, total_cache_read, total_cache_write, cfg.llm_model
+        ),
     }
 
 
@@ -433,10 +484,45 @@ def _clean_answer(text: str) -> str:
     return text.strip()
 
 
-def _estimate_cost(input_tokens: int, output_tokens: int, model: str) -> float:
-    """Rough cost estimate based on model pricing."""
-    if "sonnet" in model:
-        return (input_tokens * 3 + output_tokens * 15) / 1_000_000
-    elif "haiku" in model:
-        return (input_tokens * 1 + output_tokens * 5) / 1_000_000
-    return (input_tokens * 3 + output_tokens * 15) / 1_000_000
+# Anthropic list prices per 1M tokens (base_input, output, cache_write_5m, cache_read).
+# Source: https://platform.claude.com/docs/en/about-claude/pricing
+# Keep this table in sync with CorpusForge/cost_tracker.py::PRICING.
+_PRICING: dict[str, tuple[float, float, float, float]] = {
+    "claude-opus-4-6":                   (5.00, 25.00, 6.25, 0.50),
+    "anthropic/claude-opus-4.6":         (5.00, 25.00, 6.25, 0.50),
+    "claude-sonnet-4-6":                 (3.00, 15.00, 3.75, 0.30),
+    "anthropic/claude-sonnet-4.6":       (3.00, 15.00, 3.75, 0.30),
+    "claude-sonnet-4-20250514":          (3.00, 15.00, 3.75, 0.30),
+    "anthropic/claude-sonnet-4":         (3.00, 15.00, 3.75, 0.30),
+    "claude-haiku-4-5":                  (1.00,  5.00, 1.25, 0.10),
+    "anthropic/claude-haiku-4.5":        (1.00,  5.00, 1.25, 0.10),
+    "claude-haiku-3-5-20241022":         (0.80,  4.00, 1.00, 0.08),
+    "anthropic/claude-3.5-haiku":        (0.80,  4.00, 1.00, 0.08),
+    "claude-opus-4-20250514":            (15.00, 75.00, 18.75, 1.50),
+    "anthropic/claude-opus-4":           (15.00, 75.00, 18.75, 1.50),
+}
+_DEFAULT_PRICING = (3.00, 15.00, 3.75, 0.30)  # Sonnet 4.6
+
+
+def _compute_cost(
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    model: str = "claude-sonnet-4-6",
+) -> float:
+    """Exact dollar cost from actual API-reported token counts.
+
+    All four token counts come from `response.usage` (server-reported ground
+    truth). This function is exact given those counts and the published list
+    prices; it does NOT estimate from prompt length. Container fees for
+    server-side code_execution are billed separately on the invoice and are
+    not covered here — the API does not expose them.
+    """
+    pi, po, pcw, pcr = _PRICING.get(model, _DEFAULT_PRICING)
+    return (
+        input_tokens * pi
+        + output_tokens * po
+        + cache_write_tokens * pcw
+        + cache_read_tokens * pcr
+    ) / 1_000_000

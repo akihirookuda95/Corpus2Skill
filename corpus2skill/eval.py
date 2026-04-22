@@ -59,6 +59,9 @@ def score_result(
         "cost_usd": result.get("cost_usd", 0),
         "input_tokens": result.get("input_tokens", 0),
         "output_tokens": result.get("output_tokens", 0),
+        "cache_read_input_tokens": result.get("cache_read_input_tokens", 0),
+        "cache_creation_input_tokens": result.get("cache_creation_input_tokens", 0),
+        "per_turn_usage": result.get("per_turn_usage", []),
     }
 
 
@@ -75,6 +78,12 @@ def aggregate(scored_list: list[dict]) -> dict:
         agg[m] = sum(vals) / n if vals else 0
     agg["total_input_tokens"] = sum(s.get("input_tokens", 0) for s in scored_list)
     agg["total_output_tokens"] = sum(s.get("output_tokens", 0) for s in scored_list)
+    agg["total_cache_read_input_tokens"] = sum(
+        s.get("cache_read_input_tokens", 0) for s in scored_list
+    )
+    agg["total_cache_creation_input_tokens"] = sum(
+        s.get("cache_creation_input_tokens", 0) for s in scored_list
+    )
     agg["total_cost_usd"] = round(sum(s.get("cost_usd", 0) for s in scored_list), 6)
     agg["count"] = n
     return agg
@@ -139,6 +148,8 @@ def main():
             scored["cost_usd"] = query_cost
             scored["input_tokens"] = result.get("input_tokens", 0)
             scored["output_tokens"] = result.get("output_tokens", 0)
+            scored["cache_read_input_tokens"] = result.get("cache_read_input_tokens", 0)
+            scored["cache_creation_input_tokens"] = result.get("cache_creation_input_tokens", 0)
             scored_list.append(scored)
 
             skills_used = result.get("skills_referenced", [])

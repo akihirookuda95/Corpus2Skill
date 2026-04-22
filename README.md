@@ -95,6 +95,12 @@ python -m corpus2skill.eval \
 
 Metrics reported: F1, BLEU, ROUGE-1, ROUGE-2, Factuality (LLM judge), Context Recall (LLM judge).
 
+Per-query token accounting includes `input_tokens`, `output_tokens`, `cache_read_input_tokens`, and `cache_creation_input_tokens` (Anthropic prompt-cache fields), plus a `per_turn_usage` trace for each multi-turn agent invocation. `cost_usd` is computed from those exact counts against Anthropic's published list prices; see `corpus2skill/serve.py::_PRICING` for the pricing table.
+
+## Prompt Caching
+
+`answer_query` attaches `cache_control: {"type": "ephemeral"}` to the system prompt by default, so the stable prefix (tools + system instructions) is served from Anthropic's prompt cache on turns 2+. On our WixQA 200-query benchmark this reduced per-query cost from **\$0.172 → \$0.089** (a 48% reduction), with roughly 70% of the per-call input served from cache at one-tenth the base rate. No flag is needed to enable this — it's on by default for any account with prompt caching access.
+
 ## Project Structure
 
 ```
