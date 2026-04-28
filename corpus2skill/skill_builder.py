@@ -18,6 +18,29 @@ from pathlib import Path
 from corpus2skill.clustering import ClusterNode
 
 
+_MAX_SKILL_NAME = 60
+
+
+def _merge_unique_name(parent: str, child: str, max_len: int = _MAX_SKILL_NAME) -> str:
+    """Combine parent + child into a globally-unique, length-bounded name.
+
+    Anthropic's Skills API requires unique `name:` values across the tree.
+    We path-qualify children by prefixing with the parent's unique name and
+    truncate from the middle with a short hash to stay within limits.
+    """
+    combined = f"{parent}__{child}" if parent else child
+    if len(combined) <= max_len:
+        return combined
+    import hashlib
+
+    h = hashlib.md5(combined.encode("utf-8")).hexdigest()[:6]
+    keep = max_len - len(h) - 1  # minus separator
+    keep = max(keep, 1)
+    head = combined[: keep // 2]
+    tail = combined[-(keep - len(head)) :]
+    return f"{head}~{tail}-{h}" if tail else f"{head}-{h}"
+
+
 def _safe_name(text: str, prefix: str = "", max_len: int = 50) -> str:
     """Convert text to a filesystem-safe directory/file name."""
     name = text.lower().strip()
@@ -121,6 +144,11 @@ def _write_branch_node(node: ClusterNode, node_dir: Path, depth: int, compact: b
                 })
             else:
                 child_name = _safe_name(child.label, prefix=f"group-{ci:02d}")
+                # Make the frontmatter `name:` globally unique by qualifying
+                # with the parent's folder name. Anthropic's Skills API rejects
+                # duplicate skill/index names across the tree.
+                parent_unique = getattr(node, "_folder_name", None) or node_dir.name
+                child._folder_name = _merge_unique_name(parent_unique, child_name)
                 child_dir = node_dir / child_name
                 child_dir.mkdir(exist_ok=True)
                 _write_node(child, child_dir, depth + 1, compact=compact)
@@ -170,7 +198,7 @@ def _format_skill_md(
 ) -> str:
     """Format a SKILL.md / INDEX.md file with summary and child index."""
     folder_name = getattr(node, "_folder_name", None)
-    name = folder_name if (depth == 0 and folder_name) else (node.label or node.node_id)
+    name = folder_name if folder_name else (node.label or node.node_id)
     lines = [
         "---",
         f"name: {name}",

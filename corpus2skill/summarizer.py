@@ -64,7 +64,13 @@ def summarize_cluster(
                 max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}],
             )
-            return resp.content[0].text.strip()
+            text_parts = [getattr(b, "text", "") for b in (resp.content or [])]
+            text = "".join(p for p in text_parts if p).strip()
+            if text:
+                return text
+            if attempt < 2:
+                continue
+            return f"Cluster of {len(child_texts)} items."
         except Exception as e:
             if "rate" in str(e).lower() or "429" in str(e):
                 time.sleep(5 * (attempt + 1))
@@ -93,7 +99,20 @@ async def _async_summarize_one(
                     max_tokens=max_tokens,
                     messages=[{"role": "user", "content": prompt}],
                 )
-                return resp.content[0].text.strip()
+                text_parts: list[str] = []
+                for block in resp.content or []:
+                    t = getattr(block, "text", None)
+                    if t:
+                        text_parts.append(t)
+                text = "".join(text_parts).strip()
+                if text:
+                    return text
+                # Empty / refused response — retry a couple of times before
+                # falling back to a boilerplate summary so the compile doesn't die.
+                if attempt < 4:
+                    await asyncio.sleep(2)
+                    continue
+                return f"Cluster of {len(child_texts)} items."
             except Exception as e:
                 err = str(e).lower()
                 if "rate" in err or "429" in err or "connection" in err or "overloaded" in err:
@@ -160,8 +179,9 @@ async def _async_label_one(
                         f"Summary: {summary[:500]}"
                     )}],
                 )
-                label = resp.content[0].text.strip().lower()
-                label = "".join(c if c.isalnum() or c == "-" else "-" for c in label)
+                text_parts = [getattr(b, "text", "") for b in (resp.content or [])]
+                raw = "".join(p for p in text_parts if p).strip().lower()
+                label = "".join(c if c.isalnum() or c == "-" else "-" for c in raw)
                 label = label.strip("-")[:50]
                 return label or "cluster"
             except Exception:

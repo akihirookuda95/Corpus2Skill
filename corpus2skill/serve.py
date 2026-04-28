@@ -114,49 +114,133 @@ def _collect_skill_files(skill_dir: Path, skills_dir: Path) -> list[tuple[str, b
     return files
 
 
+def _rewrite_skill_name(content: bytes, new_name: str) -> bytes:
+    """Rewrite the `name:` field in SKILL.md frontmatter to ``new_name``.
+
+    Used when a large skill is split into multiple upload parts — Anthropic's
+    Skills API requires globally unique skill names, so each part must carry a
+    distinct top-level name even though they share the same SKILL.md body.
+    """
+    text = content.decode("utf-8", errors="replace")
+    new_text = re.sub(
+        r"^(name:\s*).+$", lambda m: f"{m.group(1)}{new_name}", text, count=1, flags=re.MULTILINE
+    )
+    return new_text.encode("utf-8")
+
+
 def _split_skill_files(
     skill_dir: Path, skills_dir: Path
 ) -> list[tuple[str, list[tuple[str, bytes, str]]]]:
     """Split a skill into chunks of <= MAX_FILES_PER_SKILL files.
 
-    If the skill fits, returns one chunk. Otherwise splits by top-level
-    sub-groups, creating multiple upload batches.
+    If the skill fits, returns one chunk. Otherwise splits by sub-groups,
+    creating multiple upload batches. Each part's top-level SKILL.md has
+    its ``name:`` rewritten to ``<skill>-partN`` so the parts are distinct
+    Anthropic skills (names are globally unique).
+
+    Oversize sub-groups are recursively decomposed into their children,
+    guaranteeing that no part ever exceeds ``MAX_FILES_PER_SKILL`` (modulo
+    the top-level SKILL.md, which is added per part).
     """
     all_files = _collect_skill_files(skill_dir, skills_dir)
     if len(all_files) <= MAX_FILES_PER_SKILL:
         return [(skill_dir.name, all_files)]
 
-    # Split by top-level sub-groups
     top_skill_md = skill_dir / "SKILL.md"
-    groups = sorted([d for d in skill_dir.iterdir() if d.is_dir()])
+    orig_name = skill_dir.name
 
-    chunks: list[tuple[str, list[tuple[str, bytes, str]]]] = []
-    current_name = f"{skill_dir.name}-part1"
-    current_files: list[tuple[str, bytes, str]] = []
+    def _decompose(d: Path) -> list[list[tuple[str, bytes, str]]]:
+        """Return a list of "blobs" (each a list of files) for directory ``d``.
 
-    # Always include the top-level SKILL.md in each part
+        - If d's full subtree fits in one chunk (≤ MAX-1 to leave room for the
+          top SKILL.md), return [its files].
+        - Otherwise descend into children recursively; their blobs are
+          flattened into the result. Files that live directly in ``d`` (e.g.
+          INDEX.md) are emitted as their own atomic blob so they ride along
+          with the first chunk that has room.
+        """
+        cap = MAX_FILES_PER_SKILL - 1  # leave room for the rewritten SKILL.md
+        files = _collect_skill_files(d, skills_dir)
+        if len(files) <= cap:
+            return [files]
+
+        # Need to descend. Separate direct files (e.g. INDEX.md) from subdirs.
+        direct_files: list[tuple[str, bytes, str]] = []
+        subdirs: list[Path] = []
+        for entry in sorted(d.iterdir()):
+            if entry.is_file() and not entry.name.startswith("."):
+                rel = str(entry.relative_to(skills_dir))
+                mime = "text/markdown" if entry.suffix == ".md" else "text/plain"
+                direct_files.append((rel, entry.read_bytes(), mime))
+            elif entry.is_dir():
+                subdirs.append(entry)
+
+        blobs: list[list[tuple[str, bytes, str]]] = []
+        if direct_files:
+            blobs.append(direct_files)
+        for sub in subdirs:
+            blobs.extend(_decompose(sub))
+
+        # Final safety: any blob still bigger than cap (e.g. a leaf with
+        # 250+ files in it) gets bucket-split arbitrarily.
+        safe_blobs: list[list[tuple[str, bytes, str]]] = []
+        for blob in blobs:
+            if len(blob) <= cap:
+                safe_blobs.append(blob)
+            else:
+                for i in range(0, len(blob), cap):
+                    safe_blobs.append(blob[i : i + cap])
+        return safe_blobs
+
+    blobs: list[list[tuple[str, bytes, str]]] = []
+    for group in sorted([e for e in skill_dir.iterdir() if e.is_dir()]):
+        blobs.extend(_decompose(group))
+
+    def _relabel(
+        files: list[tuple[str, bytes, str]], part_name: str
+    ) -> list[tuple[str, bytes, str]]:
+        """Rewrite each file's top folder segment to ``part_name``.
+
+        Anthropic requires the folder name to match the skill's ``name:`` in
+        SKILL.md. When splitting into parts we rename both, keeping the rest
+        of the path intact.
+        """
+        relabeled: list[tuple[str, bytes, str]] = []
+        for rel, content, mime in files:
+            parts = rel.split("/", 1)
+            new_rel = part_name if len(parts) == 1 else f"{part_name}/{parts[1]}"
+            relabeled.append((new_rel, content, mime))
+        return relabeled
+
     if top_skill_md.exists():
         top_rel = str(top_skill_md.relative_to(skills_dir))
-        top_content = top_skill_md.read_bytes()
-        base_file = (top_rel, top_content, "text/markdown")
+        top_bytes = top_skill_md.read_bytes()
     else:
-        base_file = None
+        top_rel = None
+        top_bytes = None
 
-    if base_file:
-        current_files.append(base_file)
+    def _part_base(name: str) -> tuple[str, bytes, str] | None:
+        if top_rel is None or top_bytes is None:
+            return None
+        return (top_rel, _rewrite_skill_name(top_bytes, name), "text/markdown")
 
+    chunks: list[tuple[str, list[tuple[str, bytes, str]]]] = []
     part_num = 1
-    for group in groups:
-        group_files = _collect_skill_files(group, skills_dir)
-        if len(current_files) + len(group_files) > MAX_FILES_PER_SKILL and current_files:
-            chunks.append((current_name, current_files))
-            part_num += 1
-            current_name = f"{skill_dir.name}-part{part_num}"
-            current_files = [base_file] if base_file else []
-        current_files.extend(group_files)
+    current_name = f"{orig_name}-part{part_num}"
+    base_file = _part_base(current_name)
+    current_files: list[tuple[str, bytes, str]] = [base_file] if base_file else []
 
-    if current_files:
-        chunks.append((current_name, current_files))
+    for blob in blobs:
+        if len(current_files) + len(blob) > MAX_FILES_PER_SKILL and len(current_files) > (1 if base_file else 0):
+            chunks.append((current_name, _relabel(current_files, current_name)))
+            part_num += 1
+            current_name = f"{orig_name}-part{part_num}"
+            base_file = _part_base(current_name)
+            current_files = [base_file] if base_file else []
+        current_files.extend(blob)
+
+    if current_files and (not base_file or len(current_files) > 1):
+        chunks.append((current_name, _relabel(current_files, current_name)))
 
     return chunks
 
@@ -301,24 +385,38 @@ def answer_query(
     start = time.time()
 
     for turn in range(cfg.max_turns):
-        try:
-            create_kwargs: dict[str, Any] = dict(
-                model=cfg.llm_model,
-                max_tokens=8192,
-                system=system_prompt,
-                tools=tools,
-                messages=messages,
-                betas=cfg.skills_betas,
-            )
-            if container:
-                create_kwargs["container"] = container
+        create_kwargs: dict[str, Any] = dict(
+            model=cfg.llm_model,
+            max_tokens=8192,
+            system=system_prompt,
+            tools=tools,
+            messages=messages,
+            betas=cfg.skills_betas,
+        )
+        if container:
+            create_kwargs["container"] = container
 
-            response = client.beta.messages.create(**create_kwargs)
-        except Exception as e:
-            if "rate" in str(e).lower() or "429" in str(e):
-                time.sleep(10)
-                continue
-            raise
+        # Retry transient API failures: 429 (rate limit), 503 (overloaded),
+        # connection errors. Up to 6 attempts with exponential backoff.
+        response = None
+        for attempt in range(6):
+            try:
+                response = client.beta.messages.create(**create_kwargs)
+                break
+            except Exception as e:
+                msg = str(e).lower()
+                transient = (
+                    "rate" in msg or "429" in msg
+                    or "overloaded" in msg or "503" in msg
+                    or "connection" in msg or "timeout" in msg
+                    or "502" in msg or "504" in msg
+                )
+                if transient and attempt < 5:
+                    time.sleep(min(60, 5 * (2 ** attempt)))
+                    continue
+                raise
+        if response is None:
+            raise RuntimeError("failed to get response after retries")
 
         u = response.usage
         t_in = getattr(u, "input_tokens", 0) or 0
@@ -351,7 +449,10 @@ def answer_query(
             },
         })
 
-        messages.append({"role": "assistant", "content": response.content})
+        sanitized_content = _sanitize_assistant_content(list(response.content))
+        if not sanitized_content:
+            sanitized_content = [{"type": "text", "text": "(continuing)"}]
+        messages.append({"role": "assistant", "content": sanitized_content})
 
         # Track skill reads from code execution results
         for block in response.content:
@@ -407,6 +508,7 @@ def answer_query(
                 "docs_retrieved": docs_retrieved,
                 "context_text": "\n\n---\n\n".join(last5),
                 "tool_trace": tool_trace,
+                "messages": messages,
                 "input_tokens": total_input,
                 "output_tokens": total_output,
                 "cache_read_input_tokens": total_cache_read,
@@ -418,6 +520,14 @@ def answer_query(
                 ),
             }
 
+        # Keep the conversation valid for models that require the final input
+        # message to come from the user. When the assistant pauses without a
+        # client-side tool call, explicitly ask it to continue.
+        messages.append({
+            "role": "user",
+            "content": [{"type": "text", "text": "Please continue."}],
+        })
+
     last5 = docs_texts[-5:]
     return {
         "answer": "Max turns reached without a final answer.",
@@ -426,6 +536,7 @@ def answer_query(
         "docs_retrieved": docs_retrieved,
         "context_text": "\n\n---\n\n".join(last5),
         "tool_trace": tool_trace,
+        "messages": messages,
         "input_tokens": total_input,
         "output_tokens": total_output,
         "cache_read_input_tokens": total_cache_read,
@@ -441,6 +552,49 @@ def answer_query(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _sanitize_assistant_content(content: list) -> list:
+    """Drop orphan server-side tool_use blocks that have no paired result.
+
+    Anthropic server-side tools (``code_execution``, ``bash_code_execution``,
+    ``text_editor_code_execution`` …) emit a ``*_tool_use`` block followed by a
+    matching ``*_tool_result`` block inside the *same* assistant turn. When a
+    response is truncated (max_tokens / pause_turn) we may receive the
+    ``_tool_use`` without its result. Replaying such a message in the next
+    request triggers ``tool use ... was found without a corresponding ...
+    tool_result block`` errors. We strip these orphans here so the conversation
+    remains valid for continuation.
+
+    Client-side ``tool_use`` blocks (type == "tool_use") are always kept — their
+    results are provided by us in the following user turn.
+    """
+    try:
+        result_ids: set[str] = set()
+        for b in content:
+            btype = getattr(b, "type", "") or ""
+            if btype.endswith("_tool_result"):
+                bid = getattr(b, "tool_use_id", None) or getattr(b, "id", None)
+                if bid:
+                    result_ids.add(bid)
+
+        cleaned: list = []
+        for b in content:
+            btype = getattr(b, "type", "") or ""
+            is_client_tool_use = btype == "tool_use"
+            is_server_tool_use = (
+                btype == "server_tool_use"
+                or (btype.endswith("_tool_use") and not is_client_tool_use)
+            )
+            if is_server_tool_use:
+                bid = getattr(b, "id", None)
+                if bid is None or bid not in result_ids:
+                    # Orphan — drop it.
+                    continue
+            cleaned.append(b)
+        return cleaned
+    except Exception:
+        return content
+
 
 def _extract_skill_name(block: Any, skills_referenced: set[str]):
     """Extract skill/document names from code execution results."""
