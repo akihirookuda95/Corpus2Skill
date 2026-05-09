@@ -4,7 +4,7 @@
 
 This is the official implementation of the paper [**"Don't Retrieve, Navigate: Distilling Enterprise Knowledge into Navigable Agent Skills for QA and RAG"**](https://arxiv.org/abs/2604.14572) (Sun, Wei, and Hsieh, 2026).
 
-Corpus2Skill converts a collection of documents into a structured tree of [Anthropic Skills](https://docs.anthropic.com/en/docs/build-with-claude/skills). At query time, the LLM agent navigates this hierarchy (reading SKILL.md / INDEX.md files, drilling into sub-topics) and fetches full documents on demand — without embeddings, vector stores, or BM25 at serve time.
+Corpus2Skill converts a collection of documents into a structured tree of [Anthropic Skills](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview). At query time, the LLM agent navigates this hierarchy (reading SKILL.md / INDEX.md files, drilling into sub-topics) and fetches full documents on demand — without embeddings, vector stores, or BM25 at serve time.
 
 > **🚧 Work in Progress** — This is an early release. The core pipeline works end-to-end, but rough edges remain. We're actively improving it and would love your feedback! Please [open an issue](../../issues) if you run into problems or have suggestions.
 
