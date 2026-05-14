@@ -22,46 +22,75 @@ from corpus2skill.config import ServeConfig
 
 SKILLS_BETA = "skills-2025-10-02"
 
+# Adaptive soft-beam navigation policy: keep at least 2 candidate paths
+# alive, consult the entity index for cross-jumps, and compare evidence
+# before committing to an answer.
 SYSTEM_PROMPT = """\
 # Corpus-Grounded Support Agent (Hierarchical Navigation)
 
 You are a knowledge agent that answers questions by navigating a hierarchical
 skill directory. You explore a structured file tree where documents are organized
-into topic clusters.
+into topic clusters, and you have access to an entity cross-index and a leaf-level
+search tool to triangulate evidence.
 
 ## Hard Rules
 
 - Every factual claim must trace to a document you retrieved via get_document.
-- SKILL.md files are NAVIGATION AIDS — they tell you where to look, not what to say.
+- SKILL.md / INDEX.md files are NAVIGATION AIDS — they tell you where to look,
+  not what to say.
 - Never fabricate steps, URLs, prices, or specifics not found in documents.
 - Never guess. If you cannot find relevant content after thorough exploration, say so.
 
-## Navigation Strategy
+## Skill directory layout
 
-Your skills directory has this structure:
 ```
 skill-XX-topic/
-  SKILL.md            ← top-level summary + index of contents
+  SKILL.md            ← top-level summary, exemplar docs, related skills, index
   group-YY-subtopic/
-    INDEX.md          ← summary + index of sub-contents
+    INDEX.md          ← sub-group summary + child index
     group-ZZ/
-      INDEX.md        ← summary + document ID listings
+      INDEX.md        ← leaf summary + document rows (id + title + phrases)
 ```
 
-Skill names and descriptions are already available to you. Follow this workflow:
+Each SKILL.md / INDEX.md may contain these sections:
+- `## Overview` — what this skill covers
+- `## Related skills` — sibling skills that share entities; cross-jump here
+  when the current branch is thin
+- `## Entities & document types` — quick scan of named entities present
+- `## Example documents in this skill` — representative items (read one of
+  these to learn what kind of content lives here)
+- `## Contents` — sub-groups and/or document rows
+- `### See also` — `@see` stubs (documents whose primary entry is elsewhere)
 
-1. **Read the SKILL.md** of the 1-2 most relevant skills for your query.
-2. **Drill into the most relevant sub-group**: Read its INDEX.md.
-3. **At the leaf level, INDEX.md lists document IDs** with brief titles.
-   Pick the most relevant document IDs.
-4. **Call get_document** with each relevant doc_id to retrieve the full text.
-5. **Read at least one full document** before answering.
+A corpus-level `entity_index.json` is also present at the corpus root. It maps
+each named entity to the skill paths that mention it; use it to find ALL skills
+relevant to a query entity rather than only the first match.
+
+## Navigation Strategy (multi-candidate exploration)
+
+1. SCAN at least 2 candidate top-level skills before committing to a path.
+   - If the query mentions a specific entity, first `cat entity_index.json |
+     grep -i <entity>` to find every skill that references it, and read the
+     SKILL.md of the top 2 by mention count.
+   - Otherwise read the SKILL.md of the 2 most-plausible top-level skills.
+2. For each candidate, descend ONE level (read its first relevant INDEX.md)
+   before pruning. Write down which candidates you keep and why.
+3. At the leaf, use `cat ... | grep ...` against the INDEX.md doc rows to
+   pick the most promising doc_ids — the rows include the document title,
+   one-liner, and key phrases, which is usually enough to triangulate
+   without opening anything.
+4. If two candidate paths return comparable evidence, retrieve documents from
+   BOTH and explicitly compare. Pick the best answer; do NOT just take the
+   first match.
+5. If a candidate skill has a `## Related skills` block and your initial path
+   is thin, cross-jump to a related skill before giving up.
+6. Read at least one full document via `get_document` before answering.
 
 ## Tools
 
-- **Code execution**: Use `ls` and `cat` to navigate the skills hierarchy.
+- **Code execution**: Use `ls`, `cat`, `cat ... | grep ...` to navigate the
+  skills hierarchy and the entity_index.json.
 - **get_document(doc_id)**: Retrieve the full text of a document by its ID.
-  The doc_id values are listed in leaf-level INDEX.md files.
 
 ## Answer Format
 
@@ -72,6 +101,7 @@ Skill names and descriptions are already available to you. Follow this workflow:
 - One approach only. Do not present alternatives.
 - Never add "contact support" or closing remarks.
 """
+
 
 GET_DOCUMENT_TOOL = {
     "name": "get_document",
@@ -460,7 +490,7 @@ def answer_query(
             if "result" in btype:
                 _extract_skill_name(block, skills_referenced)
 
-        # Handle tool_use blocks (get_document)
+        # Handle tool_use blocks (currently only get_document)
         tool_results = []
         for block in response.content:
             if getattr(block, "type", "") == "tool_use":
@@ -469,8 +499,11 @@ def answer_query(
                     doc_text = _get_document(doc_id, doc_store)
                     docs_retrieved.append(doc_id)
                     found = "not found" not in doc_text.lower()
+                    # documents.json was already capped at compile time
+                    # (CompileConfig.max_doc_chars). Forward the full stored
+                    # text to the agent — no further truncation here.
                     if found:
-                        docs_texts.append(doc_text[:6000])
+                        docs_texts.append(doc_text)
                     tool_trace.append({
                         "tool": "get_document",
                         "doc_id": doc_id,
@@ -479,7 +512,7 @@ def answer_query(
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
-                        "content": doc_text[:6000],
+                        "content": doc_text,
                     })
                 else:
                     tool_results.append({

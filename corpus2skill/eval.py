@@ -1,8 +1,8 @@
-"""Evaluate Corpus2Skill on a QA dataset.
+"""Evaluate Corpus2Skill on WixQA using the same metrics as CorpusForge.
 
 Usage:
-    python -m corpus2skill.eval \
-        --output-dir c2s_output \
+    python -m corpus2skill.eval \\
+        --output-dir c2s_output \\
         --qa wixqa_corpus/eval_sample_50.jsonl
 """
 
@@ -18,6 +18,10 @@ from pathlib import Path
 from corpus2skill.metrics import (
     compute_f1, compute_bleu, compute_rouge,
     judge_factuality, judge_context_recall,
+    compute_bertscore_f1,
+    judge_faithfulness_grounded,
+    judge_answer_relevance,
+    judge_context_precision,
 )
 from corpus2skill.serve import answer_query
 from corpus2skill.config import ServeConfig
@@ -30,7 +34,16 @@ def score_result(
     judge_client,
     judge_model: str,
 ) -> dict:
-    """Score a single result against the gold answer."""
+    """Score a single result against the gold answer.
+
+    Returns the lexical metric set (F1, BLEU, ROUGE, factuality vs gold,
+    context recall) plus the RAG-eval suite:
+
+      * ``bertscore_f1``         — semantic answer similarity
+      * ``faithfulness_grounded`` — answer claims grounded in retrieved ctx
+      * ``answer_relevance``     — does the answer address the question
+      * ``context_precision``    — how focused is the retrieved context
+    """
     predicted = result["answer"]
 
     f1 = compute_f1(predicted, gold_answer)
@@ -47,6 +60,17 @@ def score_result(
         question, gold_answer, context_text, judge_client, judge_model
     )
 
+    bert_f1 = compute_bertscore_f1(predicted, gold_answer)
+    faith_grounded = judge_faithfulness_grounded(
+        question, predicted, context_text, judge_client, judge_model
+    )
+    relevance = judge_answer_relevance(
+        question, predicted, judge_client, judge_model
+    )
+    precision = judge_context_precision(
+        question, context_text, judge_client, judge_model
+    )
+
     return {
         "f1": f1,
         "bleu": bleu,
@@ -54,6 +78,10 @@ def score_result(
         "rouge2": rouge["rouge2"],
         "factuality": fact_result.get("score_01", 0),
         "context_recall": ctx_result.get("score_01", 0),
+        "bertscore_f1": round(bert_f1, 4),
+        "faithfulness_grounded": faith_grounded.get("score_01", 0),
+        "answer_relevance": relevance.get("score_01", 0),
+        "context_precision": precision.get("score_01", 0),
         "turns": result["turns"],
         "latency": result["latency"],
         "cost_usd": result.get("cost_usd", 0),
@@ -66,16 +94,28 @@ def score_result(
 
 
 def aggregate(scored_list: list[dict]) -> dict:
-    """Compute aggregate metrics."""
+    """Compute aggregate metrics, including the RAG-eval metrics and the
+    derived hallucination_rate (faithfulness_grounded < 0.6)."""
     if not scored_list:
         return {}
-    metrics = ["f1", "bleu", "rouge1", "rouge2", "factuality", "context_recall",
-               "turns", "latency", "cost_usd"]
+    metrics = [
+        # Lexical / gold-comparison
+        "f1", "bleu", "rouge1", "rouge2", "factuality", "context_recall",
+        # Semantic + RAGAS-style judges
+        "bertscore_f1", "faithfulness_grounded", "answer_relevance",
+        "context_precision",
+        # Operational
+        "turns", "latency", "cost_usd",
+    ]
     agg = {}
     n = len(scored_list)
     for m in metrics:
         vals = [s.get(m, 0) for s in scored_list]
         agg[m] = sum(vals) / n if vals else 0
+    # Derived: hallucination rate = fraction with faithfulness_grounded < 0.6
+    # (i.e. raw 1-5 score of 3 or lower out of 5).
+    halluc = sum(1 for s in scored_list if s.get("faithfulness_grounded", 0) < 0.6)
+    agg["hallucination_rate"] = halluc / n if n else 0
     agg["total_input_tokens"] = sum(s.get("input_tokens", 0) for s in scored_list)
     agg["total_output_tokens"] = sum(s.get("output_tokens", 0) for s in scored_list)
     agg["total_cache_read_input_tokens"] = sum(
@@ -115,7 +155,7 @@ def main():
 
     cfg = ServeConfig(skills_dir=skills_dir, llm_model=args.model, max_turns=args.max_turns)
 
-    print(f"Evaluating {len(qa_pairs)} queries...")
+    print(f"Evaluating {len(qa_pairs)} queries (Corpus2Skill ablation)...")
     print(f"  Output dir: {output_dir}")
     print(f"  Skills dir: {skills_dir}")
     print(f"  Model: {args.model}")
@@ -142,9 +182,13 @@ def main():
             scored["question"] = q
             scored["predicted_answer"] = result["answer"][:3000]
             scored["gold_answer"] = gold[:2000]
-            scored["method"] = "corpus2skill"
+            scored["method"] = "Corpus2Skill"
             scored["skills_referenced"] = result.get("skills_referenced", [])
             scored["docs_retrieved"] = result.get("docs_retrieved", [])
+            # Persist retrieved context (truncated) so a later rescoring pass
+            # can recompute context-grounded metrics without re-running the
+            # agent. 16K chars ≈ the context the judges actually look at.
+            scored["context_text"] = result.get("context_text", "")[:16000]
             scored["cost_usd"] = query_cost
             scored["input_tokens"] = result.get("input_tokens", 0)
             scored["output_tokens"] = result.get("output_tokens", 0)
@@ -158,8 +202,10 @@ def main():
 
             n_docs = len(result.get("docs_retrieved", []))
             anslen = len(result["answer"])
-            print(f"  F1={scored['f1']:.3f} Fact={scored['factuality']:.2f} "
-                  f"CtxR={scored['context_recall']:.2f} "
+            print(f"  F1={scored['f1']:.3f} Bert={scored['bertscore_f1']:.3f} "
+                  f"Fact={scored['factuality']:.2f} FaithG={scored['faithfulness_grounded']:.2f} "
+                  f"Rel={scored['answer_relevance']:.2f} CtxR={scored['context_recall']:.2f} "
+                  f"CtxP={scored['context_precision']:.2f} "
                   f"turns={scored['turns']} docs={n_docs} "
                   f"skills={','.join(skills_used[:3]) if skills_used else 'none'} "
                   f"anslen={anslen} cost=${query_cost:.4f} ({elapsed:.1f}s) "
@@ -173,7 +219,7 @@ def main():
                 "question": q, "gold_answer": gold, "predicted_answer": f"ERROR: {e}",
                 "f1": 0, "bleu": 0, "rouge1": 0, "rouge2": 0,
                 "factuality": 0, "context_recall": 0,
-                "turns": 0, "latency": 0, "method": "corpus2skill",
+                "turns": 0, "latency": 0, "method": "Corpus2Skill",
                 "error_detail": str(e), "cost_usd": 0,
                 "input_tokens": 0, "output_tokens": 0,
             })
@@ -182,7 +228,7 @@ def main():
 
     output = {
         "config": {"model": args.model, "num_queries": len(qa_pairs),
-                   "version": "corpus2skill", "max_turns": args.max_turns},
+                   "version": "Corpus2Skill-ablation", "max_turns": args.max_turns},
         "aggregate": agg,
         "cost_stats": {
             "total_cost_usd": total_cost,
@@ -198,8 +244,10 @@ def main():
     print(f"\nResults saved to {out_path}")
 
     print(f"\n{'='*70}")
-    print(f"AGGREGATE ({len(scored_list)} queries, {len(errors)} errors):")
-    for k in ["f1", "bleu", "rouge1", "rouge2", "factuality", "context_recall",
+    print(f"AGGREGATE Corpus2Skill ({len(scored_list)} queries, {len(errors)} errors):")
+    for k in ["f1", "bleu", "rouge1", "rouge2", "bertscore_f1",
+              "factuality", "faithfulness_grounded", "answer_relevance",
+              "context_recall", "context_precision", "hallucination_rate",
               "turns", "latency", "cost_usd"]:
         v = agg.get(k, 'N/A')
         print(f"  {k}: {v:.4f}" if isinstance(v, (int, float)) else f"  {k}: {v}")
